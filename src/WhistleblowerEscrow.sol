@@ -9,20 +9,21 @@ contract WhistleblowerEscrow is Ownable, ReentrancyGuard {
         address whistleblower;
         string ipfsHash;
         uint256 accessFee;
+        uint256 createdAt;
         address journalist;
         bool exists;
         bool isResolved;
     }
 
     address public authorizedAgent;
+    // unique ID to each submission
+    uint256 public submissionCount;
     uint256 public constant TIMEOUT = 7 days; // to avoid stale submissions
     uint256 public constant MAX_SUBMISSIONS_PER_ADDRESS = 10; // this is to prevent spam submissions
 
     mapping(uint256 => Submission) public submissions; // mapping submission ID to Submission struct
     mapping(address => uint256) public submissionCountByAddress; // to track number of submissions per whistleblower
     mapping(address => uint256) public pendingWithdrawals; // to track pending withdrawals for whistleblowers
-    // unique ID to each submission
-    uint256 public submissionCount;
 
     event SubmissionCreated(
         uint256 indexed id,
@@ -35,9 +36,12 @@ contract WhistleblowerEscrow is Ownable, ReentrancyGuard {
         uint256 amount
     );
     event SubmissionCancelled(uint256 indexed id);
+    event SubmissionTimedOut(uint256 indexed id);
     event AgentUpdated(address indexed oldAgent, address indexed newAgent);
+    event Withdrawal(address indexed whistleblower, uint256 amount);
 
     constructor(address _agent) Ownable(msg.sender) {
+        require(_agent != address(0), "Invalid agent agent");
         authorizedAgent = _agent;
         // the trusted agent is the middleman who facilitates access
     }
@@ -60,6 +64,10 @@ contract WhistleblowerEscrow is Ownable, ReentrancyGuard {
         require(bytes(_ipfsHash).length > 0, "Empty IPFS hash");
         // whwere would they get the IPFS hash from? they would upload their info to IPFS first, get the hash, then call this function with that hash
         require(_accessFee > 0, "Fee must be positive");
+        require(
+            submissionCountByAddress[msg.sender] < MAX_SUBMISSIONS_PER_ADDRESS,
+            "Submission limit reached"
+        );
 
         // EFFECTS
         submissionCount++;
@@ -70,18 +78,15 @@ contract WhistleblowerEscrow is Ownable, ReentrancyGuard {
             ipfsHash: _ipfsHash,
             accessFee: _accessFee,
             journalist: address(0),
+            createdAt: block.timestamp,
             exists: true,
             isResolved: false
         });
-        require(
-            submissionCountByAddress[msg.sender] < MAX_SUBMISSIONS_PER_ADDRESS,
-            "Submission limit reached"
-        );
+
         submissionCountByAddress[msg.sender]++;
 
         // INTERACTIONS
         emit SubmissionCreated(submissionId, msg.sender, _accessFee);
-
         return submissionId;
     }
 
@@ -118,6 +123,19 @@ contract WhistleblowerEscrow is Ownable, ReentrancyGuard {
         }
     }
 
+    function withdrawPending() external nonReentrant {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        require(amount > 0, "Nothing to withdraw");
+        // more like a safty mechanism to allow whistleblowers to withdraw their funds if something goes wrong with direct payment
+
+        pendingWithdrawals[msg.sender] = 0;
+
+        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        require(success, "Withdraw failed");
+
+        emit Withdrawal(msg.sender, amount);
+    }
+
     function cancelSubmission(uint256 _id) external {
         Submission storage sub = submissions[_id];
         // gives whistleblower ability to cancel their submission if it hasn't been resolved yet
@@ -129,6 +147,22 @@ contract WhistleblowerEscrow is Ownable, ReentrancyGuard {
         sub.isResolved = true;
 
         emit SubmissionCancelled(_id);
+    }
+
+    function timeoutRefund(uint256 _id) external {
+        Submission storage sub = submissions[_id];
+
+        require(sub.exists, "Submission not found");
+        require(!sub.isResolved, "Already resolved");
+        require(msg.sender == sub.whistleblower, "Not your submission");
+        require(
+            block.timestamp >= sub.createdAt + TIMEOUT,
+            "Timeout not reached"
+        );
+
+        sub.isResolved = true;
+
+        emit SubmissionTimedOut(_id);
     }
 
     function getSubmission(
@@ -156,6 +190,3 @@ contract WhistleblowerEscrow is Ownable, ReentrancyGuard {
         emit AgentUpdated(oldAgent, _newAgent);
     }
 }
-
-// this blurb of code, what is it? the contract to be deployed?
-//
