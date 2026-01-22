@@ -3,135 +3,225 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
-contract WhistleblowerEscrow is Ownable, ReentrancyGuard {
+/**
+ * @title WhistleblowerEscrow
+ * @notice Handles anonymous submissions, encrypted evidence storage via IPFS, 
+ *         and payment flows between whistleblowers and journalists.
+ * @dev Uses pull pattern for withdrawals and ReentrancyGuard for payment security.
+ */
+contract WhistleblowerEscrow is Ownable, ReentrancyGuard, Pausable {
+    
+    // ============ Enums ============
+    
+    enum SubmissionStatus {
+        Pending,      // Awaiting agent evaluation
+        Verified,     // Agent scored >= 70
+        Accessed,     // Journalist paid and accessed
+        Disputed,     // Under review / slashed
+        Cancelled,    // Whistleblower cancelled
+        Refunded      // Timeout refund issued
+    }
+
+    // ============ Structs ============
+
     struct Submission {
-        address whistleblower;
-        string ipfsHash;
-        uint256 accessFee;
+        uint256 id;
+        bytes32 ipfsCIDHash;        // keccak256 of encrypted IPFS CID
+        bytes32 categoryHash;       // keccak256 of category string
+        address payable source;     // whistleblower address (zero for anonymous)
+        uint256 accessFee;          // in wei
         uint256 createdAt;
-        address journalist;
+        uint256 fundedAt;           // timestamp when journalist paid
+        uint256 stakeAmount;        // whistleblower's stake
+        SubmissionStatus status;
+        address journalist;         // assigned journalist
         bool exists;
-        bool isEvaluated;
-        uint8 evaluationScore;
-        bool isResolved;
-        EscrowState state;
-        uint256 fundedAt;
-        uint256 stakeAmount;
+    }
+
+    struct Evaluation {
+        uint256 submissionId;
+        uint8 finalScore;           // 0-100
+        string recommendedAction;   // "grant_access" | "manual_review" | "defer"
+        uint256 evaluatedAt;
     }
 
     struct JournalistProfile {
         bool exists;
         bool approved;
-        string metadata; // IPFS hash or JSON (name, outlet, proof)
+        string metadata;            // IPFS hash or JSON (name, outlet, proof)
     }
 
-    // other of functions:
-    // submit, grantAccess, withdrawPending, cancelSubmission, timeoutRefund, getSubmission, updateAgent
-    //
+    // ============ Constants ============
 
-    uint8 evaluationScore; // 0–100 scoring
-    bool isEvaluated;
-    address public authorizedAgent; // unique ID to each submission
+    uint8 public constant PASS_SCORE = 70;
+    uint256 public constant TIMEOUT = 7 days;
+    uint256 public constant MAX_SUBMISSIONS_PER_ADDRESS = 10;
+    uint256 public constant MIN_STAKE = 0.1 ether;
+    uint256 public constant MAX_ACCESS_FEE = 100 ether;
+
+    // ============ State Variables ============
+
+    address public authorizedAgent;
     uint256 public submissionCount;
-    uint8 public constant PASS_SCORE = 70; // minimum score to release funds to whistleblower
-    uint256 public constant TIMEOUT = 7 days; // to avoid stale submissions
-    uint256 public constant MAX_SUBMISSIONS_PER_ADDRESS = 10; // this is to prevent spam submissions
-    uint256 public constant MIN_STAKE = 0.1 ether; // minimum stake required
 
-    mapping(uint256 => Submission) public submissions; // mapping submission ID to Submission struct
-    mapping(address => uint256) public submissionCountByAddress; // to track number of submissions per whistleblower
-    mapping(address => uint256) public pendingWithdrawals; // to track pending withdrawals for whistleblowers
-    mapping(address => JournalistProfile) public journalists; // to track registered journalists
+    mapping(uint256 => Submission) public submissions;
+    mapping(uint256 => Evaluation) public evaluations;
+    mapping(address => uint256) public submissionCountByAddress;
+    mapping(address => uint256) public pendingWithdrawals;
+    mapping(address => JournalistProfile) public journalists;
+    mapping(uint256 => bytes32) public accessTokens;
+
+    // ============ Events ============
 
     event SubmissionCreated(
         uint256 indexed id,
         address indexed whistleblower,
-        uint256 fee
+        bytes32 ipfsCIDHash,
+        uint256 accessFee,
+        uint256 timestamp
     );
-    event AccessGranted(
+
+    event SubmissionEvaluated(
+        uint256 indexed id,
+        uint8 finalScore,
+        string recommendedAction
+    );
+
+    event SubmissionAccessed(
         uint256 indexed id,
         address indexed journalist,
+        uint256 amount,
+        uint256 timestamp
+    );
+
+    event FundsWithdrawn(
+        address indexed to,
         uint256 amount
     );
+
     event SubmissionCancelled(uint256 indexed id);
     event SubmissionTimedOut(uint256 indexed id);
     event AgentUpdated(address indexed oldAgent, address indexed newAgent);
-    event Withdrawal(address indexed whistleblower, uint256 amount);
-    event SubmissionEvaluated(
-        uint256 indexed id,
-        uint8 score,
-        address indexed agent
-    );
-    event FundsLocked(uint256 indexed id, uint256 amount);
-    event FundsReleased(uint256 indexed id, address indexed to);
-    event FundsRefunded(uint256 indexed id);
+    event StakeSlashed(uint256 indexed id, uint256 amount);
     event JournalistRegistered(address indexed journalist, string metadata);
-    event JournalistApprovedUpdated(address indexed journalist, bool approved);
+    event JournalistApprovalUpdated(address indexed journalist, bool approved);
 
-    enum EscrowState {
-        Submitted,
-        Funded,
-        Evaluated,
-        Released,
-        Cancelled,
-        Refunded
-    }
+    // ============ Constructor ============
 
     constructor(address _agent) Ownable(msg.sender) {
-        require(_agent != address(0), "Invalid agent agent");
+        require(_agent != address(0), "Invalid agent address");
         authorizedAgent = _agent;
-        // the trusted agent is the middleman who facilitates access
     }
+
+    // ============ Modifiers ============
 
     modifier onlyAgent() {
-        require(msg.sender == authorizedAgent, "Unauthorized agent");
+        require(msg.sender == authorizedAgent, "Unauthorized: not agent");
         _;
-        // only the authorized agent can call functions with this modifier and not the whistleblower or journalist directly
     }
 
-    function submit(
-        // this is the entry point for the whistleblower to submit their info
-        // so at the frontend, they will provide the IPFS hash and the access fee
-        // this function validates the whitlesblowers input, creates new submisson, stores it onchain , returns a sumbmission ID
-        // for each submission made, would each whitleblower have different submision IDs?or one uinque ID will be tied to that address? no, each submisson comes with its ID
-        string memory _ipfsHash,
-        uint256 _accessFee
-    ) external payable returns (uint256) {
-        require(msg.value >= MIN_STAKE, "Insufficient funds");
-        require(bytes(_ipfsHash).length > 0, "Empty IPFS hash");
-        // whwere would they get the IPFS hash from? they would upload their info to IPFS first, get the hash, then call this function with that hash
+    // ============ Whistleblower Functions ============
+
+    /**
+     * @notice Create a new submission with encrypted evidence
+     * @param _ipfsCIDHash keccak256 hash of the encrypted IPFS CID
+     * @param _categoryHash keccak256 hash of the category string
+     * @param _accessFee Fee required for journalists to access (in wei)
+     * @param _anonymous If true, source address is set to zero for anonymity
+     * @return submissionId The unique ID of the created submission
+     */
+    function createSubmission(
+        bytes32 _ipfsCIDHash,
+        bytes32 _categoryHash,
+        uint256 _accessFee,
+        bool _anonymous
+    ) external payable whenNotPaused returns (uint256) {
+        require(msg.value >= MIN_STAKE, "Insufficient stake");
+        require(_ipfsCIDHash != bytes32(0), "Empty IPFS hash");
         require(_accessFee > 0, "Fee must be positive");
+        require(_accessFee <= MAX_ACCESS_FEE, "Fee exceeds maximum");
         require(
             submissionCountByAddress[msg.sender] < MAX_SUBMISSIONS_PER_ADDRESS,
             "Submission limit reached"
         );
 
-        // EFFECTS
         submissionCount++;
         uint256 submissionId = submissionCount;
+        submissionCountByAddress[msg.sender]++;
 
         submissions[submissionId] = Submission({
-            whistleblower: msg.sender,
-            ipfsHash: _ipfsHash,
+            id: submissionId,
+            ipfsCIDHash: _ipfsCIDHash,
+            categoryHash: _categoryHash,
+            source: _anonymous ? payable(address(0)) : payable(msg.sender),
             accessFee: _accessFee,
-            journalist: address(0),
             createdAt: block.timestamp,
-            exists: true,
-            isResolved: false,
-            evaluationScore: 0,
-            isEvaluated: false,
-            state: EscrowState.Submitted,
             fundedAt: 0,
-            stakeAmount: msg.value
+            stakeAmount: msg.value,
+            status: SubmissionStatus.Pending,
+            journalist: address(0),
+            exists: true
         });
 
-        emit SubmissionCreated(submissionId, msg.sender, _accessFee);
+        emit SubmissionCreated(
+            submissionId,
+            _anonymous ? address(0) : msg.sender,
+            _ipfsCIDHash,
+            _accessFee,
+            block.timestamp
+        );
+
         return submissionId;
     }
 
-    function registeredJournalist(string calldata _metadata) external {
-        require(!journalists[msg.sender].exists, "already registered bruvh");
+    /**
+     * @notice Cancel a pending submission and reclaim stake
+     * @param _submissionId The ID of the submission to cancel
+     */
+    function cancelSubmission(uint256 _submissionId) external nonReentrant whenNotPaused {
+        Submission storage sub = submissions[_submissionId];
+        
+        require(sub.exists, "Submission not found");
+        require(msg.sender == sub.source, "Not your submission");
+        require(sub.status == SubmissionStatus.Pending, "Cannot cancel: not pending");
+
+        sub.status = SubmissionStatus.Cancelled;
+
+        // Refund stake to whistleblower
+        if (sub.stakeAmount > 0) {
+            uint256 refund = sub.stakeAmount;
+            sub.stakeAmount = 0;
+            pendingWithdrawals[msg.sender] += refund;
+        }
+
+        emit SubmissionCancelled(_submissionId);
+    }
+
+    /**
+     * @notice Withdraw accumulated funds (earnings + refunded stakes)
+     */
+    function withdrawFunds() external nonReentrant {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        require(amount > 0, "Nothing to withdraw");
+
+        pendingWithdrawals[msg.sender] = 0;
+
+        (bool success, ) = payable(msg.sender).call{value: amount}("");
+        require(success, "Withdrawal failed");
+
+        emit FundsWithdrawn(msg.sender, amount);
+    }
+
+    // ============ Journalist Functions ============
+
+    /**
+     * @notice Register as a journalist
+     * @param _metadata IPFS hash or JSON containing journalist credentials
+     */
+    function registerJournalist(string calldata _metadata) external {
+        require(!journalists[msg.sender].exists, "Already registered");
 
         journalists[msg.sender] = JournalistProfile({
             exists: true,
@@ -142,90 +232,197 @@ contract WhistleblowerEscrow is Ownable, ReentrancyGuard {
         emit JournalistRegistered(msg.sender, _metadata);
     }
 
+    /**
+     * @notice Pay to access a verified submission
+     * @param _submissionId The ID of the submission to access
+     * @return accessToken Unique token for claiming decryption key
+     */
+    function accessSubmission(uint256 _submissionId) 
+        external 
+        payable 
+        nonReentrant 
+        whenNotPaused
+        returns (bytes32 accessToken) 
+    {
+        Submission storage sub = submissions[_submissionId];
+        
+        require(sub.exists, "Submission does not exist");
+        require(sub.status == SubmissionStatus.Verified, "Not verified for access");
+        require(msg.value >= sub.accessFee, "Insufficient payment");
+        require(journalists[msg.sender].approved, "Journalist not approved");
+
+        sub.status = SubmissionStatus.Accessed;
+        sub.journalist = msg.sender;
+        sub.fundedAt = block.timestamp;
+
+        // Generate deterministic access token
+        accessToken = keccak256(abi.encodePacked(
+            _submissionId,
+            msg.sender,
+            block.timestamp,
+            blockhash(block.number - 1)
+        ));
+        accessTokens[_submissionId] = accessToken;
+
+        // Credit whistleblower (or contract if anonymous)
+        if (sub.source != address(0)) {
+            pendingWithdrawals[sub.source] += sub.accessFee;
+        } else {
+            // Anonymous submission: funds held in contract for manual claim
+            pendingWithdrawals[address(this)] += sub.accessFee;
+        }
+
+        // Also credit whistleblower's stake back
+        if (sub.stakeAmount > 0) {
+            pendingWithdrawals[sub.source] += sub.stakeAmount;
+            sub.stakeAmount = 0;
+        }
+
+        emit SubmissionAccessed(_submissionId, msg.sender, msg.value, block.timestamp);
+
+        // Refund excess payment
+        if (msg.value > sub.accessFee) {
+            (bool success, ) = payable(msg.sender).call{value: msg.value - sub.accessFee}("");
+            require(success, "Refund failed");
+        }
+
+        return accessToken;
+    }
+
+    /**
+     * @notice Get submission metadata (public view)
+     * @param _submissionId The ID of the submission
+     */
+    function getSubmission(uint256 _submissionId)
+        external
+        view
+        returns (Submission memory)
+    {
+        require(submissions[_submissionId].exists, "Submission not found");
+        return submissions[_submissionId];
+    }
+
+    // ============ Agent Functions ============
+
+    /**
+     * @notice Record evaluation result from AI agent
+     * @param _submissionId The ID of the submission to evaluate
+     * @param _finalScore Score from 0-100
+     * @param _recommendedAction Action recommendation string
+     */
+    function recordEvaluation(
+        uint256 _submissionId,
+        uint8 _finalScore,
+        string calldata _recommendedAction
+    ) external onlyAgent {
+        require(_finalScore <= 100, "Score must be 0-100");
+        
+        Submission storage sub = submissions[_submissionId];
+        require(sub.exists, "Submission does not exist");
+        require(sub.status == SubmissionStatus.Pending, "Already evaluated");
+
+        evaluations[_submissionId] = Evaluation({
+            submissionId: _submissionId,
+            finalScore: _finalScore,
+            recommendedAction: _recommendedAction,
+            evaluatedAt: block.timestamp
+        });
+
+        // Auto-verify if score meets threshold
+        if (_finalScore >= PASS_SCORE) {
+            sub.status = SubmissionStatus.Verified;
+        }
+
+        emit SubmissionEvaluated(_submissionId, _finalScore, _recommendedAction);
+    }
+
+    /**
+     * @notice Approve or reject a journalist
+     * @param _journalist Address of the journalist
+     * @param _approved Whether to approve or reject
+     */
     function approveJournalist(
         address _journalist,
         bool _approved
     ) external onlyAgent {
         require(journalists[_journalist].exists, "Journalist not registered");
-
         journalists[_journalist].approved = _approved;
-
-        emit JournalistApprovedUpdated(_journalist, _approved);
+        emit JournalistApprovalUpdated(_journalist, _approved);
     }
 
-    function assignJournalist(
-        uint256 _submissionId,
-        address _journalist
-    ) external onlyAgent {
+    /**
+     * @notice Slash stake for low-scoring or fraudulent submissions
+     * @param _submissionId The ID of the submission
+     */
+    function slashStake(uint256 _submissionId) external onlyAgent {
         Submission storage sub = submissions[_submissionId];
 
         require(sub.exists, "Submission does not exist");
-        require(sub.state == EscrowState.Submitted, "Invalid state");
-        require(sub.journalist == address(0), "Joyrnalist already assigned");
-        require(journalists[_journalist].approved, "Journalist not approved");
+        require(sub.status == SubmissionStatus.Pending || sub.status == SubmissionStatus.Verified, "Invalid state for slash");
+        require(evaluations[_submissionId].evaluatedAt > 0, "Not evaluated");
+        require(evaluations[_submissionId].finalScore < PASS_SCORE, "Cannot slash: score too high");
 
-        sub.journalist = _journalist;
+        uint256 stake = sub.stakeAmount;
+        require(stake > 0, "No stake to slash");
+        
+        sub.stakeAmount = 0;
+        sub.status = SubmissionStatus.Disputed;
+
+        pendingWithdrawals[authorizedAgent] += stake;
+
+        emit StakeSlashed(_submissionId, stake);
     }
 
-    function evaluteSubmission(
-        uint256 _submissionId,
-        uint8 _score
-    ) external onlyAgent {
-        require(_score <= 100, "Score must be 0 - 100");
+    /**
+     * @notice Claim timeout refund for stale submissions
+     * @param _submissionId The ID of the submission
+     */
+    function timeoutRefund(uint256 _submissionId) external nonReentrant {
+        Submission storage sub = submissions[_submissionId];
 
-        Submission storage submission = submissions[_submissionId];
-        require(submission.exists, "Submission does not exits");
-        require(!submission.isEvaluated, "Already evalauted");
+        require(sub.exists, "Submission does not exist");
+        require(sub.status == SubmissionStatus.Accessed, "Not refundable");
+        require(sub.fundedAt > 0, "Not funded");
+        require(block.timestamp >= sub.fundedAt + TIMEOUT, "Timeout not reached");
 
-        submission.evaluationScore = _score;
-        submission.isEvaluated = true;
+        sub.status = SubmissionStatus.Refunded;
 
-        emit SubmissionEvaluated(_submissionId, _score, msg.sender);
+        // Return access fee to journalist (something went wrong)
+        pendingWithdrawals[sub.journalist] += sub.accessFee;
+
+        emit SubmissionTimedOut(_submissionId);
     }
 
-    function grantAccess(
-        uint256 _submissionId,
-        address _journalist
-    ) external payable onlyAgent nonReentrant {
-        // CHECKS
-        Submission storage submission = submissions[_submissionId];
-        require(submission.exists, "Submission does not exist"); // make sure the submission exits
-        require(!submission.isResolved, "Already resolved"); // ← CRITICAL FIX to prevent re-entrancy attacks
-        require(msg.value >= submission.accessFee, "Insufficient payment"); // that funds sent is greater than or equal to the required submisson fee stated by the whistleblower
-        require(_journalist != address(0), "Invalid journalist"); //
+    // ============ Admin Functions ============
 
-        // EFFECTS
-        submission.isResolved = true;
-        submission.journalist = _journalist;
+    /**
+     * @notice Update the authorized agent address
+     * @param _newAgent New agent address
+     */
+    function setAgent(address _newAgent) external onlyOwner {
+        require(_newAgent != address(0), "Invalid address");
 
-        // INTERACTIONS
-        submission.state = EscrowState.Funded;
-        submission.fundedAt = block.timestamp;
+        address oldAgent = authorizedAgent;
+        authorizedAgent = _newAgent;
 
-        emit AccessGranted(_submissionId, _journalist, submission.accessFee);
-
-        // Refund excess to agent
-        if (msg.value > submission.accessFee) {
-            (bool refundSuccess, ) = payable(msg.sender).call{
-                value: msg.value - submission.accessFee
-            }("");
-            require(refundSuccess, "Refund failed");
-        }
+        emit AgentUpdated(oldAgent, _newAgent);
     }
 
-    function withdrawPending() external nonReentrant {
-        uint256 amount = pendingWithdrawals[msg.sender];
-        require(amount > 0, "Nothing to withdraw");
-
-        // EFFECTS
-        pendingWithdrawals[msg.sender] = 0;
-
-        // INTERACTIONS
-        (bool success, ) = payable(msg.sender).call{value: amount}("");
-        require(success, "Withdraw failed");
-
-        emit Withdrawal(msg.sender, amount);
+    /**
+     * @notice Pause all state-changing operations
+     */
+    function pause() external onlyOwner {
+        _pause();
     }
+
+    /**
+     * @notice Unpause contract operations
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    // ============ Fallback ============
 
     receive() external payable {
         revert("Use protocol functions");
@@ -233,110 +430,5 @@ contract WhistleblowerEscrow is Ownable, ReentrancyGuard {
 
     fallback() external payable {
         revert("Invalid call");
-    }
-
-    function cancelSubmission(uint256 _id) external {
-        Submission storage sub = submissions[_id];
-        // gives whistleblower ability to cancel their submission if it hasn't been resolved yet
-
-        require(sub.exists, "Submission not found");
-        require(msg.sender == sub.whistleblower, "Not your submission");
-        require(!sub.isResolved, "Already resolved");
-
-        sub.isResolved = true;
-
-        emit SubmissionCancelled(_id);
-    }
-
-    function releaseFunds(uint256 _id) external onlyAgent nonReentrant {
-        Submission storage sub = submissions[_id];
-
-        require(sub.exists, "Submission doesnt exist");
-        require(sub.state == EscrowState.Funded, "Not funded");
-        require(sub.isEvaluated, "Not Evaluated");
-        require(sub.evaluationScore >= PASS_SCORE, "evaluation score too low");
-
-        sub.state = EscrowState.Released;
-
-        pendingWithdrawals[sub.whistleblower] += sub.accessFee;
-    }
-
-    function withdrawFunds() external nonReentrant {
-        uint256 amount = pendingWithdrawals[msg.sender];
-        require(amount > 0, "Nothing to withdraw");
-
-        pendingWithdrawals[msg.sender] = 0;
-
-        (bool allGood, ) = payable(msg.sender).call{value: amount}("");
-        require(allGood, "Withdrawal failed");
-    }
-
-    function timeoutRefund(uint256 _id) external {
-        Submission storage sub = submissions[_id];
-
-        require(sub.state == EscrowState.Funded, "Not refundable");
-        require(
-            block.timestamp >= sub.createdAt + TIMEOUT,
-            "Timeout not reached"
-        );
-        sub.state = EscrowState.Refunded;
-
-        pendingWithdrawals[authorizedAgent] += sub.accessFee;
-
-        sub.isResolved = true;
-
-        emit SubmissionTimedOut(_id);
-    }
-
-    function getSubmission(
-        uint256 _id // makes it read-only
-    )
-        external
-        view
-        returns (
-            string memory ipfsHash,
-            uint256 accessFee,
-            bool isResolved,
-            address journalist
-        )
-    {
-        Submission storage sub = submissions[_id];
-        require(sub.exists, "Submission not found");
-
-        require(
-            msg.sender == sub.whistleblower ||
-                msg.sender == authorizedAgent ||
-                msg.sender == sub.journalist,
-            "Unauthorized"
-        );
-        return (sub.ipfsHash, sub.accessFee, sub.isResolved, sub.journalist);
-    }
-
-    function slashStake(uint256 _id) external onlyAgent {
-        Submission storage sub = submissions[_id];
-
-        require(sub.exists, "Submission doesnt exist");
-        require(sub.state == EscrowState.Funded, "Not funded");
-        require(sub.isEvaluated, "Not evaluated");
-        require(
-            sub.evaluationScore < PASS_SCORE,
-            "Cannot slash, score too high"
-        );
-
-        uint256 stake = sub.stakeAmount;
-        sub.stakeAmount = 0;
-
-        pendingWithdrawals[authorizedAgent] += stake;
-
-        emit FundsRefunded(_id);
-    }
-
-    function updateAgent(address _newAgent) external onlyOwner {
-        require(_newAgent != address(0), "Invalid address");
-
-        address oldAgent = authorizedAgent;
-        authorizedAgent = _newAgent;
-
-        emit AgentUpdated(oldAgent, _newAgent);
     }
 }
